@@ -85,6 +85,10 @@ struct aardvark_sf_pkthdr {
 #define ULOGD_AARDVARK_DEFAULT_SERVER_IP "127.0.0.1"
 #endif
 
+#ifndef ULOGD_AARDVARK_BUF_DEFAULT
+#define ULOGD_AARDVARK_BUF_DEFAULT	1024
+#endif
+
 #define NIPQUAD(addr) \
 	((unsigned char *)&addr)[0], \
 	((unsigned char *)&addr)[1], \
@@ -92,7 +96,7 @@ struct aardvark_sf_pkthdr {
         ((unsigned char *)&addr)[3]
 
 static struct config_keyset aardvark_kset = {
-	.num_ces = 3,
+	.num_ces = 4,
 	.ces = {
 		{ 
 			.key = "file", 
@@ -112,11 +116,18 @@ static struct config_keyset aardvark_kset = {
 			.options = CONFIG_OPT_NONE,
 			.u = { .string = ULOGD_AARDVARK_DEFAULT_SERVER_IP },
 		},
+		{ 
+			.key = "buffer_size", 
+			.type = CONFIG_TYPE_INT,
+			.options = CONFIG_OPT_NONE,
+			.u = { .value = ULOGD_AARDVARK_BUF_DEFAULT },
+		},
 	},
 };
 
 struct aardvark_instance {
 	FILE *of;
+        char* buf;
 };
 
 struct intr_id {
@@ -185,34 +196,40 @@ static int interp_aardvark(struct ulogd_pluginstance *upi)
 		pchdr.ts.tv_usec = tv.tv_usec;
 	}
 
-        /* Convert ts to millisecond */
-        uint64_t time_in_millisecond = (uint64_t)pchdr.ts.tv_sec * 1000 + (uint64_t)pchdr.ts.tv_usec / 1000;
-        char* hex = (char*)malloc(pchdr.caplen*2 + 1);
-        if(hex == NULL) {
-		ulogd_log(ULOGD_ERROR, "Error during malloc: %s\n",
-			  strerror(errno));
+        if(pi->buf == NULL) {
+		ulogd_log(ULOGD_ERROR, "pi->buf is NULL\n");
 		return ULOGD_IRET_ERR;
         }
 
+        /* Convert ts to millisecond */
+        uint64_t time_in_millisecond = (uint64_t)pchdr.ts.tv_sec * 1000 + (uint64_t)pchdr.ts.tv_usec / 1000;
+        uint32_t mlen = upi->config_kset->ces[3].u.value / 2;
+        mlen = mlen > pchdr.caplen ? pchdr.caplen : mlen;
+        
         /* Convert binary data in res[0] to hex format in order to be transferred by flumeNG  */
         char* cpt = (char*)(ikey_get_ptr(&res[0]));
+        int digit;
+        char* bptr = pi->buf;
         uint32_t i = 0;
-        for(; i < pchdr.caplen; i++) {
-            sprintf(hex + i*2, "%02x", cpt[i]);
+        for(; i < mlen; i++, cpt++)
+        {
+            digit = (*cpt >> 4) & 0xf;
+            *bptr++ = ( digit > 9 ) ? digit + 'a' - 10 : digit + '0';
+      
+            digit = *cpt & 0xf;
+            *bptr++ = ( digit > 9 ) ? digit + 'a' - 10 : digit + '0';
         }
-        hex[pchdr.caplen*2 + 1] = '\0';
+        *bptr = '\0';
 
-        if (fprintf(pi->of, "%lu %s %s\n", time_in_millisecond, upi->config_kset->ces[2].u.string, hex) < 0) {
+        if (fprintf(pi->of, "%lu %s %s\n", time_in_millisecond, upi->config_kset->ces[2].u.string, pi->buf) < 0) {
 		ulogd_log(ULOGD_ERROR, "Error during write: %s\n",
 			  strerror(errno));
-                free(hex);
 		return ULOGD_IRET_ERR;
 	}
 
 	if (upi->config_kset->ces[1].u.value)
 		fflush(pi->of);
 
-        free(hex);
 	return ULOGD_IRET_OK;
 }
 
@@ -270,12 +287,23 @@ static int configure_aardvark(struct ulogd_pluginstance *upi,
 
 static int start_aardvark(struct ulogd_pluginstance *upi)
 {
+	struct aardvark_instance *pi = (struct aardvark_instance *) &upi->private;
+	pi->buf = (char*)malloc(upi->config_kset->ces[3].u.value + 1);
+        if(pi->buf == NULL)
+        {
+            ulogd_log(ULOGD_ERROR, "Error during malloc, size:%d bytes", upi->config_kset->ces[3].u.value);
+            return ULOGD_IRET_ERR;
+        }       
+
 	return append_create_outfile(upi);
 }
 
 static int stop_aardvark(struct ulogd_pluginstance *upi)
 {
 	struct aardvark_instance *pi = (struct aardvark_instance *) &upi->private;
+
+        if (pi->buf)
+                free(pi->buf);
 
 	if (pi->of)
 		fclose(pi->of);
